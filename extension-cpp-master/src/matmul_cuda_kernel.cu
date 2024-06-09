@@ -1,89 +1,62 @@
 #include <torch/extension.h>
+#include <ATen/ATen.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
 #define MATRIX_SIZE 32
+#define TILE_SIZE 32
 
 template <typename scalar_t>
 __global__ void matmul_kernel(
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> a,
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> b,
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> out,
+    const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
+    scalar_t* __restrict__ out,
+    int num_matrices
 ) {
+    int batch_idx = blockIdx.x;
 
-    // Remember the block is quare so blockDim.x = blockDim.y
-    const int blocksize = blockDim.x 
+    if (batch_idx >= num_matrices) return;
 
+    // Adjust pointers for the current batch
+    a += batch_idx * MATRIX_SIZE * MATRIX_SIZE;
+    b += batch_idx * MATRIX_SIZE * MATRIX_SIZE;
+    out += batch_idx * MATRIX_SIZE * MATRIX_SIZE;
 
-    // Shared memory defined when the kernel was called. 
-    // Accessing it using __shared__
-    extern __shared__ scalar_t shared_mem[]; // 
+    __shared__ scalar_t a_tile[TILE_SIZE][TILE_SIZE];
+    __shared__ scalar_t b_tile[TILE_SIZE][TILE_SIZE];
 
-    // Split shared memory euqally between a_sub and b_sub
-    scalar_t* a_sub_base = shared_mem;
-    scalar_t* b_sub_base = shared_mem + blocksize * blocksize;
+    int row = threadIdx.y;
+    int col = threadIdx.x;
 
-    // Accessors
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> a_sub(
-        a_sub_base, {blocksize, blocksize});
-    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> b_sub(
-        b_sub_base, {blocksize, blocksize});
+    a_tile[row][col] = a[row * MATRIX_SIZE + col];
+    b_tile[row][col] = b[row * MATRIX_SIZE + col];
 
-    // Global id (x,y) in the matrix
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
+    __syncthreads();
 
-    if (x >= out.size(0) || y >= out.size(1)) {
-        return;
+    scalar_t value = 0;
+
+    #pragma unroll
+    for (int i = 0; i < TILE_SIZE; ++i) {
+        value += a_tile[row][i] * b_tile[i][col];
     }
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int bpg = gridDim.x;  
+    __syncthreads();
 
-
-    scalar_t tmp = 0.0;
-    for (int i = 0; i < bpg; ++i) {
-
-        int b_sub_row = tx + i * blocksize;
-        int a_sub_col = ty + i * blocksize;
-
-        if (b_sub_row < b.size(0) && a_sub_col < a.size(1)) {
-            // Load data into shared memory
-            a_sub[tx][ty] = a[x][a_sub_col];
-            b_sub[tx][ty] = b[b_sub_row][y];
-        } else {
-            a_sub[tx][ty] = 0.0;
-            b_sub[tx][ty] = 0.0;
-        }
-
-
-        __syncthreads();
-
-
-        for (int j = 0; j < blocksize; ++j) {
-            tmp += a_sub[tx][j] * b_sub[j][ty];
-        }
-
-        __syncthreads();
-    }
-
-
-    out[x][y] = tmp;
+    out[row * MATRIX_SIZE + col] = value;
 }
 
-torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
-    auto out = torch::zeros({MATRIX_SIZE, MATRIX_SIZE}, a.options());
-    const int blocksize  = at::cuda::getCurrentDeviceProperties()->warpSize;
-    const dim3 block_dim(blocksize , blocksize );
-    const int grid_size  = (MATRIX_SIZE + blocksize  - 1) / blocksize 
-    const dim3 grid_dim(grid_size , grid_size);
-    const int shared_mem_size = 2 * blocksize * blocksize * sizeof(float);
+at::Tensor matmul_cuda(at::Tensor a, at::Tensor b, int num_matrices) {
+    auto out = torch::zeros({num_matrices, MATRIX_SIZE, MATRIX_SIZE}, a.options());
+
+    const dim3 block_dim(TILE_SIZE, TILE_SIZE);
+    const dim3 grid_dim(num_matrices);  // One block per matrix pair
 
     AT_DISPATCH_FLOATING_TYPES(a.scalar_type(), "matmul_kernel", ([&] {
-        matmul_kernel<scalar_t><<<grid_dim, block_dim, shared_mem_size>>>(
-            a.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-            b.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-            out.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+        matmul_kernel<scalar_t><<<grid_dim, block_dim>>>(
+            a.data_ptr<scalar_t>(),
+            b.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            num_matrices
         );
     }));
 

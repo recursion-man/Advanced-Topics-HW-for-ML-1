@@ -1,15 +1,15 @@
-# src/matmul.py
-
 import matmul_cuda
+import torch
 
-
-def matmul(a1_ls, a2_ls, cuda_device='cuda:0'):
-    out_ls = []
+def matmul(a1_ls, a2_ls):
+    # Stack the list of tensors into a single batch tensor
+    a1_batch = torch.stack(a1_ls).to('cuda:0')
+    a2_batch = torch.stack(a2_ls).to('cuda:0')
     
-    for a1, a2 in zip(a1_ls, a2_ls):
-        a1 = a1.to(cuda_device)
-        a2 = a2.to(cuda_device)
-        out = matmul_cuda.matmul(a1, a2)
-        out_ls.append(out)
+    # Perform batched matrix multiplication
+    out_batch = matmul_cuda.matmul(a1_batch, a2_batch)
+    
+    # Convert the batch tensor back into a list of tensors
+    out_ls = [out_batch[i] for i in range(out_batch.size(0))]
     
     return out_ls
